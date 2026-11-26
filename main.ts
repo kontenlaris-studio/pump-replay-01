@@ -1,12 +1,13 @@
 // Pump.fun Replay Sprint — paper-trading bot (agent-fun/replay/v2).
 //
-// Wiring only: the strategy lives in strategy.ts. This file hands it to the
-// vendored SDK shim's runBot loop, which owns the wire (one JSON line in, one
-// reply per batch out).
+// Entrypoint and wiring only. The trading decisions live in strategy.ts;
+// this module adapts that strategy to the vendored SDK's runBot loop.
 //
-// The bot is deterministic: its orders depend only on the hello, the batch
-// events and the fills, never on the clock or Math.random, so the two grading
-// executions produce byte-identical action logs.
+// Determinism is part of the contract: order decisions are derived only
+// from the hello message, batch events, account state, and fills. Nothing
+// here consults a wall clock, random source, or process environment, so a
+// replay of the same tape produces the same action stream. Keeping this
+// adapter thin also makes the strategy independently testable.
 
 import { runBot } from './vendor/makefun-bot.ts';
 import { MomentumRider } from './strategy.ts';
@@ -17,6 +18,7 @@ await runBot({
   onHello(state) {
     strategy.onHello(state);
   },
+
   onBatch(state, batch) {
     return strategy.onBatch(state, batch);
   },
