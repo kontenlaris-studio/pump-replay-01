@@ -1,28 +1,37 @@
-// Broad-flow momentum rider for the pump.fun replay (agent-fun/replay/v2).
+// Selective scalp rider for the pump.fun replay (agent-fun/replay/v2).
 //
-// Market shape: every coin is a bonding curve. Price is virtual SOL reserves
-// over virtual token reserves; a coin graduates when its real SOL reserves
-// fill the curve, and the overwhelming majority of coins die within minutes
-// of launch. Chasing every new coin bleeds fees (about 1% of curve fees on
-// each side, plus a fixed tx fee per order, plus a share of failed txs), so
-// this bot only rides coins whose demand is already proven and broad:
+// Why the previous broad momentum rider lost: it round-tripped 168 times at
+// an 18% win rate. On this venue a round trip costs about 2.5% in curve
+// fees (95 bps protocol + 30 bps creator, each side) plus 0.000105 SOL of
+// fixed tx fees, and most coins that have already run hard are at their top.
+// Chasing them with a 30% hard stop and a trailing stop that only armed at
+// +50% meant the average loser dwarfed the average winner.
 //
-//   - the curve survived its first minute and holds a real-reserve floor;
-//   - over the last FLOW_WINDOW slots the flow is one-sided: most SOL is
-//     buying, from many distinct wallets, with net inflow positive;
-//   - the price is rising over the window and still near its window high;
-//   - the coin's creator has not sold a single token (a creator sell is the
-//     most reliable death signal on this venue).
+// This rewrite trades far less and gets out fast:
 //
-// Exits are rule-based and fee-aware: a hard stop, a trailing stop that arms
-// once a run is real, a flow-fade exit when the crowd turns, an instant exit
-// on a creator sell or a whale flush, and a maximum hold. Position size is a
-// fixed slice of the starting capital, scaled up only for the broadest flow,
-// and never past the harness's per-mint reserve cap.
+//   Entries — only coins whose demand is proven but whose price is not yet
+//   extended: real reserves at or above 10 SOL (so the 1%-of-reserve order
+//   cap still allows a meaningful size), a short recent window in which
+//   buys are at least 75% of flow from at least 10 distinct wallets, and a
+//   price that rose between 4% and 30% across the window and sits within
+//   8% of the window high. A creator sell at any point disqualifies the
+//   coin forever.
 //
-// Everything is a pure function of the hello, the batch events and the fills:
-// integer (bigint) math only, no clock, no environment, no randomness, so the
-// two graded executions produce byte-identical action logs.
+//   Exits — fee-aware scalping: take profit at +12% of value over cost,
+//   a trailing stop that arms at +10% and fires 6% under the peak, a hard
+//   stop at -9%, an instant exit on a creator sell or a whale flush, a
+//   flow-fade exit, and a maximum hold of 800 slots (~5 minutes). No
+//   position is ever averaged down and no mint is re-entered for 1,500
+//   slots after an exit. (An earlier, slower exit set — +16% take profit,
+//   -11% stop, 1,500-slot hold — graded lower on the dev tape; faster
+//   exits recycle capital into fresh setups instead of riding fades.)
+//
+//   Sizing — a fixed 0.30 SOL slice, capped by the harness's per-mint
+//   reserve cap, at most 3 open positions, and a 1 SOL cash buffer.
+//
+// Everything is a pure function of the hello, the batch events and the
+// fills: integer (bigint) math only, no clock, no environment, no
+// randomness, so the two graded executions produce byte-identical logs.
 
 import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 import { LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
@@ -30,29 +39,28 @@ import { LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
 const SOL = LAMPORTS_PER_SOL;
 
 // ---- entry tuning -----------------------------------------------------------
-const MIN_AGE_SLOTS = 150; // ~1 minute: skip the sniper noise at launch
-const MAX_AGE_SLOTS = 30_000; // stale curves rarely start a second life
-const RESERVE_FLOOR = 6n * SOL; // real SOL reserves: the coin survived
-const FLOW_WINDOW = 120; // slots of flow history behind every decision
-const MIN_FLOW_BUY = 3n * SOL; // SOL of buys inside the window
-const MIN_BUY_SHARE_BPS = 6_500; // buys are at least 65% of window flow
-const MIN_DISTINCT_BUYERS = 8; // breadth: not one whale carrying the coin
-const MIN_RISE_BPS = 1_000; // price up at least 10% across the window
-const MAX_DIP_FROM_HIGH_BPS = 1_500; // still within 15% of the window high
-const BASE_SIZE = (SOL * 3n) / 10n; // 0.30 SOL per position
-const STRONG_SIZE = SOL / 2n; // 0.50 SOL when the flow is exceptional
-const STRONG_BUY_SHARE_BPS = 8_000;
-const STRONG_DISTINCT_BUYERS = 15;
-const MAX_POSITIONS = 5;
+const MIN_AGE_SLOTS = 100; // skip the sniper noise at launch
+const MAX_AGE_SLOTS = 12_000; // stale curves rarely start a second life
+const RESERVE_FLOOR = 10n * SOL; // real SOL reserves: the coin survived
+const FLOW_WINDOW = 90; // slots of flow history behind every decision
+const MIN_FLOW_BUY = 2n * SOL; // SOL of buys inside the window
+const MIN_BUY_SHARE_BPS = 7_500; // buys are at least 75% of window flow
+const MIN_DISTINCT_BUYERS = 10; // breadth: not one whale carrying the coin
+const MIN_RISE_BPS = 400; // price up at least 4% across the window
+const MAX_RISE_BPS = 3_000; // but not already extended: no blow-off tops
+const MAX_DIP_FROM_HIGH_BPS = 800; // still within 8% of the window high
+const SIZE = (SOL * 3n) / 10n; // 0.30 SOL per position (reserve cap applies)
+const MAX_POSITIONS = 3;
 const CASH_BUFFER = SOL; // never commit the last SOL
 const BUY_SLIPPAGE_BPS = 500;
-const REENTRY_COOLDOWN = 600; // slots to sit out a mint after exiting it
+const REENTRY_COOLDOWN = 1_500; // slots to sit out a mint after exiting it
 
 // ---- exit tuning ------------------------------------------------------------
-const HARD_STOP_BPS = 3_000; // value 30% under cost: sell everything
-const TRAIL_ARM_BPS = 5_000; // trailing arms once value is 50% over cost
-const TRAIL_DROP_BPS = 2_800; // then sell 28% under the peak value
-const MAX_HOLD_SLOTS = 7_200; // ~48 minutes at 0.4 s slots
+const TAKE_PROFIT_BPS = 1_200; // value 12% over cost: sell everything
+const HARD_STOP_BPS = 900; // value 9% under cost: sell everything
+const TRAIL_ARM_BPS = 1_000; // trailing arms once value is 10% over cost
+const TRAIL_DROP_BPS = 600; // then sell 6% under the peak value
+const MAX_HOLD_SLOTS = 800; // ~5 minutes at 0.4 s slots
 const WHALE_SELL = 2n * SOL; // one sell this big is a flush signal
 const SELL_SLIPPAGE_BPS = 800;
 
@@ -197,7 +205,6 @@ export class MomentumRider {
       if (realQuote >= RESERVE_FLOOR / 2n || this.held.has(ev.mint) || this.buyPending.has(ev.mint)) {
         w.window.push({ slot: ev.slot, sol: BigInt(ev.sol_amount), buy: ev.is_buy, user: ev.user, price: w.lastPrice });
         while (w.window.length > 0 && ev.slot - w.window[0].slot > FLOW_WINDOW) w.window.shift();
-        // Recompute the window anchors from what is actually in the window.
         w.priceWindowStart = w.window.length > 0 ? w.window[0].price : 0n;
         w.windowHigh = 0n;
         for (const t of w.window) if (t.price > w.windowHigh) w.windowHigh = t.price;
@@ -250,6 +257,7 @@ export class MomentumRider {
 
       let exit = false;
       if (w && w.creatorSold) exit = true; // creator bailed: leave now
+      else if (value > 0n && value * 10_000n >= cost * BigInt(10_000 + TAKE_PROFIT_BPS)) exit = true;
       else if (value > 0n && value * 10_000n <= cost * BigInt(10_000 - HARD_STOP_BPS)) exit = true;
       else if (
         h.peakValue > 0n &&
@@ -261,7 +269,7 @@ export class MomentumRider {
       else if (w) {
         const s = this.windowStats(w, slot);
         if (s.whaleSell) exit = true;
-        else if (s.sellSol > s.buySol && s.sellSol >= SOL) exit = true; // flow faded
+        else if (s.sellSol > s.buySol && s.sellSol >= SOL / 2n) exit = true; // flow faded
       }
 
       if (exit) {
@@ -298,15 +306,14 @@ export class MomentumRider {
       if (s.buySol * 10_000n < flow * BigInt(MIN_BUY_SHARE_BPS)) continue;
       if (s.buyers.size < MIN_DISTINCT_BUYERS) continue;
 
-      // Momentum: price now vs the price at the window's start, and the dip
-      // from the window high.
+      // Momentum, but not extension: price rose across the window, is not
+      // up more than MAX_RISE_BPS, and sits near the window high.
       if (w.priceWindowStart <= 0n || w.lastPrice <= 0n) continue;
       if (w.lastPrice * 10_000n < w.priceWindowStart * BigInt(10_000 + MIN_RISE_BPS)) continue;
+      if (w.lastPrice * 10_000n > w.priceWindowStart * BigInt(10_000 + MAX_RISE_BPS)) continue;
       if (w.windowHigh > 0n && w.lastPrice * 10_000n < w.windowHigh * BigInt(10_000 - MAX_DIP_FROM_HIGH_BPS)) continue;
 
-      const strong =
-        s.buySol * 10_000n >= flow * BigInt(STRONG_BUY_SHARE_BPS) && s.buyers.size >= STRONG_DISTINCT_BUYERS;
-      let size = strong ? STRONG_SIZE : BASE_SIZE;
+      let size = SIZE;
       const cap = state.maxBuyLamports(mint);
       if (cap <= 0n) continue;
       if (size > cap) size = cap;
